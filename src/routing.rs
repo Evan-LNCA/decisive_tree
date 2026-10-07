@@ -1,0 +1,307 @@
+//! Orthogonal (right-angle) connector routing.
+//!
+//! Fan-out (one source side feeding many targets) and fan-in (many sources
+//! feeding one target side) share a common trunk close to the shared node,
+//! producing the "bus" look of hand-drawn process maps.
+
+use crate::model::{Doc, Edge, Node, Side};
+use egui::{Pos2, Rect, Vec2, pos2};
+use std::collections::HashMap;
+
+pub const STUB: f32 = 18.0;
+const FAN_TRUNK: f32 = 22.0;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Axis {
+    /// Segment is vertical; dragging moves it along X.
+    X,
+    /// Segment is horizontal; dragging moves it along Y.
+    Y,
+}
+
+#[derive(Clone, Debug)]
+pub struct Route {
+    pub points: Vec<Pos2>,
+    pub from_side: Side,
+    pub to_side: Side,
+    /// Position of the draggable middle segment and the axis it moves along.
+    pub handle: Option<(Pos2, Axis)>,
+}
+
+pub fn compute_routes(doc: &Doc) -> HashMap<u64, Route> {
+    let nodes: HashMap<u64, &Node> = doc.nodes.iter().map(|n| (n.id, n)).collect();
+    let mut resolved: Vec<(&Edge, &Node, &Node, Side, Side)> = Vec::with_capacity(doc.edges.len());
+    let mut out_count: HashMap<(u64, Side), u32> = HashMap::new();
+    let mut in_count: HashMap<(u64, Side), u32> = HashMap::new();
+
+    for e in &doc.edges {
+        let (Some(a), Some(b)) = (nodes.get(&e.from), nodes.get(&e.to)) else { continue };
+        let (s1, s2) = resolve_sides(e.from_side, e.to_side, a.rect(), b.rect());
+        *out_count.entry((a.id, s1)).or_default() += 1;
+        *in_count.entry((b.id, s2)).or_default() += 1;
+        resolved.push((e, a, b, s1, s2));
+    }
+
+    let mut routes = HashMap::with_capacity(resolved.len());
+    for (e, a, b, s1, s2) in resolved {
+        let fan_src = out_count.get(&(a.id, s1)).copied().unwrap_or(0) > 1;
+        let fan_dst = in_count.get(&(b.id, s2)).copied().unwrap_or(0) > 1;
+        let input = RouteInput {
+            p1: a.port(s1),
+            s1,
+            p2: b.port(s2),
+            s2,
+            r1: a.rect(),
+            r2: b.rect(),
+            fan_src,
+            fan_dst,
+            bend: e.bend,
+        };
+        let (points, handle) = route(&input);
+        routes.insert(e.id, Route { points: simplify(points), from_side: s1, to_side: s2, handle });
+    }
+    routes
+}
+
+/// Route for an in-progress connection drag (target is a free point).
+pub fn preview_route(from: &Node, from_side: Option<Side>, target: Pos2, target_node: Option<(&Node, Option<Side>)>) -> Vec<Pos2> {
+    let target_rect = match target_node {
+        Some((n, _)) => n.rect(),
+        None => Rect::from_center_size(target, Vec2::splat(1.0)),
+    };
+    let (s1, s2) = resolve_sides(from_side, target_node.and_then(|(_, s)| s), from.rect(), target_rect);
+    let p2 = match target_node {
+        Some((n, _)) => n.port(s2),
+        None => target,
+    };
+    let input = RouteInput {
+        p1: from.port(s1),
+        s1,
+        p2,
+        s2,
+        r1: from.rect(),
+        r2: target_rect,
+        fan_src: false,
+        fan_dst: false,
+        bend: 0.0,
+    };
+    simplify(route(&input).0)
+}
+
+pub fn resolve_sides(from: Option<Side>, to: Option<Side>, a: Rect, b: Rect) -> (Side, Side) {
+    match (from, to) {
+        (Some(f), Some(t)) => (f, t),
+        (Some(f), None) => (f, auto_end_side(f, a, b)),
+        (None, Some(t)) => (auto_end_side(t, b, a), t),
+        (None, None) => auto_sides(a, b),
+    }
+}
+
+fn auto_sides(a: Rect, b: Rect) -> (Side, Side) {
+    let gx = (b.min.x - a.max.x).max(a.min.x - b.max.x);
+    let gy = (b.min.y - a.max.y).max(a.min.y - b.max.y);
+    let horizontal = if gx > 0.0 && gy > 0.0 {
+        gx >= gy * 0.6
+    } else if gx > 0.0 {
+        true
+    } else if gy > 0.0 {
+        false
+    } else {
+        let d = b.center() - a.center();
+        d.x.abs() >= d.y.abs()
+    };
+    let d = b.center() - a.center();
+    if horizontal {
+        if d.x >= 0.0 { (Side::Right, Side::Left) } else { (Side::Left, Side::Right) }
+    } else if d.y >= 0.0 {
+        (Side::Bottom, Side::Top)
+    } else {
+        (Side::Top, Side::Bottom)
+    }
+}
+
+/// Given a fixed side on node `a`, pick the best side on node `b`.
+fn auto_end_side(fixed: Side, a: Rect, b: Rect) -> Side {
+    let d = b.center() - a.center();
+    match fixed {
+        Side::Right if b.min.x > a.max.x + STUB => Side::Left,
+        Side::Left if b.max.x < a.min.x - STUB => Side::Right,
+        Side::Bottom if b.min.y > a.max.y + STUB => Side::Top,
+        Side::Top if b.max.y < a.min.y - STUB => Side::Bottom,
+        Side::Left | Side::Right => {
+            if d.y >= 0.0 { Side::Top } else { Side::Bottom }
+        }
+        Side::Top | Side::Bottom => {
+            if d.x >= 0.0 { Side::Left } else { Side::Right }
+        }
+    }
+}
+
+struct RouteInput {
+    p1: Pos2,
+    s1: Side,
+    p2: Pos2,
+    s2: Side,
+    r1: Rect,
+    r2: Rect,
+    fan_src: bool,
+    fan_dst: bool,
+    bend: f32,
+}
+
+fn tp(p: Pos2) -> Pos2 {
+    pos2(p.y, p.x)
+}
+
+fn ts(s: Side) -> Side {
+    match s {
+        Side::Top => Side::Left,
+        Side::Left => Side::Top,
+        Side::Bottom => Side::Right,
+        Side::Right => Side::Bottom,
+    }
+}
+
+fn tr(r: Rect) -> Rect {
+    Rect::from_min_max(tp(r.min), tp(r.max))
+}
+
+fn route(i: &RouteInput) -> (Vec<Pos2>, Option<(Pos2, Axis)>) {
+    if i.s1.is_horizontal() {
+        return route_h(i);
+    }
+    // Transpose so the source side is horizontal, route, then transpose back.
+    let t = RouteInput {
+        p1: tp(i.p1),
+        s1: ts(i.s1),
+        p2: tp(i.p2),
+        s2: ts(i.s2),
+        r1: tr(i.r1),
+        r2: tr(i.r2),
+        fan_src: i.fan_src,
+        fan_dst: i.fan_dst,
+        bend: i.bend,
+    };
+    let (pts, handle) = route_h(&t);
+    let handle = handle.map(|(p, axis)| (tp(p), if axis == Axis::X { Axis::Y } else { Axis::X }));
+    (pts.into_iter().map(tp).collect(), handle)
+}
+
+/// Routing when the source side is Left or Right.
+fn route_h(i: &RouteInput) -> (Vec<Pos2>, Option<(Pos2, Axis)>) {
+    let (p1, p2) = (i.p1, i.p2);
+    let d1 = i.s1.dir();
+    let d2 = i.s2.dir();
+    let a = p1 + d1 * STUB;
+    let b = p2 + d2 * STUB;
+
+    if i.s2.is_horizontal() {
+        let ahead = (p2.x - p1.x) * d1.x;
+        let opposite = d1.x != d2.x;
+        if opposite && ahead > STUB * 0.5 {
+            let gap = (p2.x - p1.x).abs();
+            let base = if i.fan_src && !i.fan_dst {
+                p1.x + d1.x * FAN_TRUNK.min(gap * 0.5)
+            } else if i.fan_dst && !i.fan_src {
+                p2.x + d2.x * FAN_TRUNK.min(gap * 0.5)
+            } else {
+                (p1.x + p2.x) * 0.5
+            };
+            let x = base + i.bend;
+            let pts = vec![p1, pos2(x, p1.y), pos2(x, p2.y), p2];
+            let handle = ((p1.y - p2.y).abs() > 1.0 || i.bend != 0.0).then(|| (pos2(x, (p1.y + p2.y) * 0.5), Axis::X));
+            return (pts, handle);
+        }
+        if !opposite {
+            // Both ports face the same way: wrap around the outside.
+            let base = if d1.x > 0.0 { i.r1.max.x.max(i.r2.max.x) + STUB } else { i.r1.min.x.min(i.r2.min.x) - STUB };
+            let x = base + i.bend;
+            let pts = vec![p1, pos2(x, p1.y), pos2(x, p2.y), p2];
+            return (pts, Some((pos2(x, (p1.y + p2.y) * 0.5), Axis::X)));
+        }
+        // Target is behind the source: loop around via a horizontal channel.
+        let base = if i.r2.min.y > i.r1.max.y {
+            (i.r1.max.y + i.r2.min.y) * 0.5
+        } else if i.r1.min.y > i.r2.max.y {
+            (i.r2.max.y + i.r1.min.y) * 0.5
+        } else {
+            i.r1.max.y.max(i.r2.max.y) + STUB
+        };
+        let y = base + i.bend;
+        let pts = vec![p1, a, pos2(a.x, y), pos2(b.x, y), b, p2];
+        return (pts, Some((pos2((a.x + b.x) * 0.5, y), Axis::Y)));
+    }
+
+    // Source horizontal, target vertical.
+    let corner = pos2(p2.x, p1.y);
+    let ok1 = (corner.x - p1.x) * d1.x >= STUB * 0.5;
+    let ok2 = (p2.y - corner.y) * (-d2.y) >= STUB * 0.5;
+    if ok1 && ok2 && i.bend == 0.0 {
+        return (vec![p1, corner, p2], None);
+    }
+    let base = if ok1 { (p1.x + p2.x) * 0.5 } else { a.x };
+    let x = base + i.bend;
+    let pts = vec![p1, pos2(x, p1.y), pos2(x, b.y), b, p2];
+    (pts, Some((pos2(x, (p1.y + b.y) * 0.5), Axis::X)))
+}
+
+/// Removes duplicate and collinear points.
+pub fn simplify(points: Vec<Pos2>) -> Vec<Pos2> {
+    let mut out: Vec<Pos2> = Vec::with_capacity(points.len());
+    for p in points {
+        if let Some(last) = out.last()
+            && (*last - p).length_sq() < 0.01
+        {
+            continue;
+        }
+        while out.len() >= 2 {
+            let a = out[out.len() - 2];
+            let b = out[out.len() - 1];
+            let collinear = ((a.x - b.x).abs() < 0.01 && (b.x - p.x).abs() < 0.01)
+                || ((a.y - b.y).abs() < 0.01 && (b.y - p.y).abs() < 0.01);
+            if collinear {
+                out.pop();
+            } else {
+                break;
+            }
+        }
+        out.push(p);
+    }
+    out
+}
+
+pub fn distance_to_polyline(points: &[Pos2], p: Pos2) -> f32 {
+    points
+        .windows(2)
+        .map(|w| distance_to_segment(w[0], w[1], p))
+        .fold(f32::INFINITY, f32::min)
+}
+
+fn distance_to_segment(a: Pos2, b: Pos2, p: Pos2) -> f32 {
+    let ab = b - a;
+    let len_sq = ab.length_sq();
+    if len_sq < 1e-6 {
+        return (p - a).length();
+    }
+    let t = ((p - a).dot(ab) / len_sq).clamp(0.0, 1.0);
+    (p - (a + ab * t)).length()
+}
+
+/// Where an edge label is anchored: the segment entering the target if it is
+/// long enough (it is unique per edge), otherwise the longest segment.
+pub fn label_anchor(points: &[Pos2]) -> Pos2 {
+    if points.len() < 2 {
+        return points.first().copied().unwrap_or_default();
+    }
+    let n = points.len();
+    let last = (points[n - 2], points[n - 1]);
+    if (last.1 - last.0).length() >= 40.0 || n == 2 {
+        return last.0 + (last.1 - last.0) * 0.5;
+    }
+    let (a, b) = points
+        .windows(2)
+        .map(|w| (w[0], w[1]))
+        .max_by(|x, y| (x.1 - x.0).length_sq().total_cmp(&(y.1 - y.0).length_sq()))
+        .unwrap_or(last);
+    a + (b - a) * 0.5
+}
