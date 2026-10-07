@@ -187,6 +187,16 @@ pub fn paint_edge(painter: &Painter, view: &View, edge: &Edge, route: &Route, hi
     paint_polyline(painter, &pts, Stroke::new(width, color), edge.style.dashed, edge.style.arrow, view.zoom);
 }
 
+/// Screen-space box occupied by an edge label (None if the label is empty).
+pub fn label_screen_rect(view: &View, edge: &Edge, anchor: Pos2, ctx: &egui::Context, fonts: &FontRegistry) -> Option<Rect> {
+    if edge.label.is_empty() {
+        return None;
+    }
+    let font = FontId::new(edge.style.font_size * view.zoom, fonts.family(crate::presets::DEFAULT_FONT, false));
+    let g = layout_plain(ctx, &edge.label, font, edge.style.label_color, false, f32::INFINITY, view.zoom);
+    Some(Rect::from_center_size(view.to_screen(anchor), g.rect.size() + vec2(6.0, 2.0) * view.zoom))
+}
+
 pub fn paint_edge_label(painter: &Painter, view: &View, edge: &Edge, anchor: Pos2, ctx: &egui::Context, fonts: &FontRegistry) {
     if edge.label.is_empty() {
         return;

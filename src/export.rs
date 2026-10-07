@@ -180,7 +180,7 @@ pub fn build_svg(doc: &Doc, routes: &HashMap<u64, Route>, ctx: &egui::Context, f
             continue;
         }
         let Some(route) = routes.get(&e.id) else { continue };
-        let anchor = label_anchor(&route.points);
+        let anchor = label_anchor(&route.points, e.label_pos);
         let font = FontId::new(e.style.font_size, fonts.family(crate::presets::DEFAULT_FONT, false));
         let g = layout_plain(ctx, &e.label, font, e.style.label_color, false, f32::INFINITY, 1.0);
         let bg = Rect::from_center_size(anchor, g.rect.size() + vec2(6.0, 2.0));

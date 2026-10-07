@@ -4,7 +4,7 @@
 //! feeding one target side) share a common trunk close to the shared node,
 //! producing the "bus" look of hand-drawn process maps.
 
-use crate::model::{Doc, Edge, Node, Side};
+use crate::model::{Doc, Edge, LabelPos, Node, Side};
 use egui::{Pos2, Rect, Vec2, pos2};
 use std::collections::HashMap;
 
@@ -287,9 +287,24 @@ fn distance_to_segment(a: Pos2, b: Pos2, p: Pos2) -> f32 {
     (p - (a + ab * t)).length()
 }
 
-/// Where an edge label is anchored: the segment entering the target if it is
-/// long enough (it is unique per edge), otherwise the longest segment.
-pub fn label_anchor(points: &[Pos2]) -> Pos2 {
+/// Where an edge label sits for a given placement.
+pub fn label_anchor(points: &[Pos2], pos: LabelPos) -> Pos2 {
+    match pos {
+        LabelPos::Auto => auto_label_anchor(points),
+        LabelPos::Along(t) => point_along(points, t),
+        LabelPos::SegMid(i) => {
+            if points.len() < 2 {
+                return points.first().copied().unwrap_or_default();
+            }
+            let i = i.min(points.len() - 2);
+            points[i] + (points[i + 1] - points[i]) * 0.5
+        }
+    }
+}
+
+/// Default anchor: the segment entering the target if it is long enough
+/// (it is unique per edge), otherwise the longest segment.
+fn auto_label_anchor(points: &[Pos2]) -> Pos2 {
     if points.len() < 2 {
         return points.first().copied().unwrap_or_default();
     }
@@ -304,4 +319,52 @@ pub fn label_anchor(points: &[Pos2]) -> Pos2 {
         .max_by(|x, y| (x.1 - x.0).length_sq().total_cmp(&(y.1 - y.0).length_sq()))
         .unwrap_or(last);
     a + (b - a) * 0.5
+}
+
+fn polyline_length(points: &[Pos2]) -> f32 {
+    points.windows(2).map(|w| (w[1] - w[0]).length()).sum()
+}
+
+/// Point at fraction `t` (0..1) of the polyline's length.
+pub fn point_along(points: &[Pos2], t: f32) -> Pos2 {
+    let total = polyline_length(points);
+    let Some(&first) = points.first() else { return Pos2::ZERO };
+    if total <= 0.0 {
+        return first;
+    }
+    let mut remaining = t.clamp(0.0, 1.0) * total;
+    for w in points.windows(2) {
+        let len = (w[1] - w[0]).length();
+        if remaining <= len && len > 0.0 {
+            return w[0] + (w[1] - w[0]) * (remaining / len);
+        }
+        remaining -= len;
+    }
+    *points.last().unwrap_or(&first)
+}
+
+/// Closest point on the polyline to `p`, as (fraction of total length, point).
+pub fn project_along(points: &[Pos2], p: Pos2) -> (f32, Pos2) {
+    let total = polyline_length(points);
+    let Some(&first) = points.first() else { return (0.0, p) };
+    let mut best = (f32::INFINITY, 0.0, first);
+    let mut walked = 0.0;
+    for w in points.windows(2) {
+        let ab = w[1] - w[0];
+        let len = ab.length();
+        let t = if len > 0.0 { ((p - w[0]).dot(ab) / (len * len)).clamp(0.0, 1.0) } else { 0.0 };
+        let q = w[0] + ab * t;
+        let d = (p - q).length_sq();
+        if d < best.0 {
+            best = (d, walked + t * len, q);
+        }
+        walked += len;
+    }
+    let frac = if total > 0.0 { best.1 / total } else { 0.0 };
+    (frac, best.2)
+}
+
+/// Midpoints of every segment, in order from the source.
+pub fn segment_midpoints(points: &[Pos2]) -> Vec<Pos2> {
+    points.windows(2).map(|w| w[0] + (w[1] - w[0]) * 0.5).collect()
 }

@@ -1,6 +1,6 @@
 use crate::export::{self, ExportFormat};
 use crate::fonts::{self, FontRegistry};
-use crate::model::{Doc, Edge, FILE_EXT, Node, NodeShape, NodeStyle, Side};
+use crate::model::{Doc, Edge, FILE_EXT, LabelPos, Node, NodeShape, NodeStyle, Side};
 use crate::presets::PRESETS;
 use crate::render::View;
 use crate::routing::{self, Axis};
@@ -84,6 +84,7 @@ pub enum Drag {
     Connect { from: u64, side: Option<Side> },
     Reconnect { edge: u64, end: End },
     Bend { edge: u64, axis: Axis, start: Pos2, orig: f32 },
+    Label { edge: u64 },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -972,6 +973,7 @@ impl DecisiveApp {
                 (_, Some(_)) => "Typing: Enter = done · Shift+Enter = new line · Tab = add next step · Esc = done",
                 (Drag::Connect { .. }, _) => "Drop on a node (or one of its ports) to connect · drop on empty space to create a new connected step",
                 (Drag::Reconnect { .. }, _) => "Drop on another node or port to re-route this connector",
+                (Drag::Label { .. }, _) => "Slide the label along the line · snaps to segment midpoints (hold Alt to place freely)",
                 _ => "Double-click: add/edit · Drag a blue port dot to connect · Tab: next step · Shift+Tab: branch below · Middle-drag/Space-drag: pan · Ctrl+wheel: zoom",
             };
             ui.label(egui::RichText::new(hint).weak());
@@ -1258,6 +1260,15 @@ impl DecisiveApp {
                     std::mem::swap(&mut t.from, &mut t.to);
                     std::mem::swap(&mut t.from_side, &mut t.to_side);
                     t.bend = 0.0;
+                    t.label_pos = match t.label_pos {
+                        LabelPos::Along(f) => LabelPos::Along(1.0 - f),
+                        _ => LabelPos::Auto,
+                    };
+                }
+            }
+            if ui.button("Auto label position").on_hover_text("Labels can be dragged along their connector").clicked() {
+                for t in self.doc.edges.iter_mut().filter(|t| ids.contains(&t.id)) {
+                    t.label_pos = LabelPos::Auto;
                 }
             }
         });
@@ -1407,6 +1418,7 @@ const HELP: &[(&str, &str)] = &[
     ("Enter while typing", "Finish (Shift+Enter for a new line)"),
     ("Drag connector end dot", "Re-route to another node or port"),
     ("Drag connector square", "Move the bend"),
+    ("Drag connector label", "Slide it along the line; snaps to segment midpoints (Alt = free)"),
     ("Drag empty space", "Box select (Shift = add)"),
     ("Shift+click", "Add/remove from selection"),
     ("Arrows / Shift+Arrows", "Nudge selection"),

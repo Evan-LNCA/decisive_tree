@@ -1,5 +1,5 @@
 use crate::app::{DecisiveApp, Drag, EditTarget, End, GRID, Handle};
-use crate::model::{Node, Side};
+use crate::model::{LabelPos, Node, Side};
 use crate::presets::PRESETS;
 use crate::render::{self, SELECT_COLOR, View, layout_text, text_wrap_width};
 use crate::routing::{self, Axis, Route};
@@ -13,6 +13,8 @@ const PORT_OFF: f32 = 13.0;
 const HANDLE_HIT: f32 = 7.0;
 const EDGE_HIT: f32 = 6.0;
 const GUIDE_COLOR: Color32 = Color32::from_rgb(0xE0, 0x3E, 0x9A);
+/// Screen distance within which a dragged label snaps to a segment midpoint.
+const LABEL_SNAP: f32 = 14.0;
 
 #[derive(Clone, Copy, Debug)]
 enum Hit {
@@ -22,6 +24,7 @@ enum Hit {
     Port(u64, Side),
     Node(u64),
     Edge(u64),
+    Label(u64),
     None,
 }
 
@@ -39,7 +42,7 @@ fn consume_plain_enter(ctx: &egui::Context) -> bool {
 }
 
 impl DecisiveApp {
-    fn hit(&self, routes: &HashMap<u64, Route>, screen: Pos2) -> Hit {
+    fn hit(&self, ctx: &egui::Context, routes: &HashMap<u64, Route>, screen: Pos2) -> Hit {
         let view = self.view();
         let world = view.to_world(screen);
 
@@ -72,6 +75,9 @@ impl DecisiveApp {
                 return Hit::Bend(*id, axis);
             }
         }
+        if let Some(id) = self.label_under(ctx, routes, screen) {
+            return Hit::Label(id);
+        }
         if let Some((id, Some(side))) = self.port_under(screen, None) {
             return Hit::Port(id, side);
         }
@@ -87,6 +93,23 @@ impl DecisiveApp {
             }
         }
         Hit::None
+    }
+
+    /// Edge whose label box is under a screen position.
+    fn label_under(&self, ctx: &egui::Context, routes: &HashMap<u64, Route>, screen: Pos2) -> Option<u64> {
+        let view = self.view();
+        self.doc
+            .edges
+            .iter()
+            .rev()
+            .filter(|e| !e.label.is_empty())
+            .find(|e| {
+                routes
+                    .get(&e.id)
+                    .and_then(|r| render::label_screen_rect(&view, e, routing::label_anchor(&r.points, e.label_pos), ctx, &self.fonts))
+                    .is_some_and(|b| b.expand(2.0).contains(screen))
+            })
+            .map(|e| e.id)
     }
 
     /// Node (and port, if the pointer is on one) under a screen position.
@@ -134,7 +157,7 @@ impl DecisiveApp {
             self.drag = Drag::Pan;
             return;
         }
-        self.drag = match self.hit(routes, origin) {
+        self.drag = match self.hit(ctx, routes, origin) {
             Hit::Resize(id, handle) => match self.doc.node(id) {
                 Some(n) => Drag::Resize { id, handle, orig: n.rect() },
                 None => Drag::None,
@@ -156,6 +179,10 @@ impl DecisiveApp {
                 }
                 let orig = self.doc.nodes.iter().filter(|n| self.sel_nodes.contains(&n.id)).map(|n| (n.id, n.pos)).collect();
                 Drag::Move { anchor: id, start: world, orig }
+            }
+            Hit::Label(id) => {
+                self.select_only_edge(id);
+                Drag::Label { edge: id }
             }
             Hit::Edge(id) => {
                 self.select_only_edge(id);
@@ -179,7 +206,7 @@ impl DecisiveApp {
         };
     }
 
-    fn update_drag(&mut self, ctx: &egui::Context, pointer: Pos2, delta: Vec2) {
+    fn update_drag(&mut self, ctx: &egui::Context, routes: &HashMap<u64, Route>, pointer: Pos2, delta: Vec2) {
         let world = self.view().to_world(pointer);
         let alt = ctx.input(|i| i.modifiers.alt);
         match self.drag.clone() {
@@ -265,6 +292,26 @@ impl DecisiveApp {
                     e.bend = bend;
                 }
             }
+            Drag::Label { edge } => {
+                let Some(r) = routes.get(&edge) else { return };
+                let (frac, on_line) = routing::project_along(&r.points, world);
+                let mut pos = LabelPos::Along(frac);
+                if self.snap && !alt {
+                    let thr = LABEL_SNAP / self.zoom;
+                    let near = routing::segment_midpoints(&r.points)
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, m)| (i, (m - on_line).length()))
+                        .filter(|(_, d)| *d <= thr)
+                        .min_by(|a, b| a.1.total_cmp(&b.1));
+                    if let Some((i, _)) = near {
+                        pos = LabelPos::SegMid(i);
+                    }
+                }
+                if let Some(e) = self.doc.edge_mut(edge) {
+                    e.label_pos = pos;
+                }
+            }
             Drag::Connect { .. } | Drag::Reconnect { .. } | Drag::None => {}
         }
     }
@@ -340,7 +387,7 @@ impl DecisiveApp {
         if self.editing.is_some() {
             self.finish_edit();
         }
-        match self.hit(routes, pointer) {
+        match self.hit(ctx, routes, pointer) {
             Hit::Node(id) | Hit::Port(id, _) => {
                 if toggle {
                     if !self.sel_nodes.remove(&id) {
@@ -350,7 +397,7 @@ impl DecisiveApp {
                     self.select_only_node(id);
                 }
             }
-            Hit::Edge(id) | Hit::Bend(id, _) | Hit::EdgeEnd(id, _) => {
+            Hit::Edge(id) | Hit::Label(id) | Hit::Bend(id, _) | Hit::EdgeEnd(id, _) => {
                 if toggle {
                     if !self.sel_edges.remove(&id) {
                         self.sel_edges.insert(id);
@@ -369,13 +416,13 @@ impl DecisiveApp {
         }
     }
 
-    fn double_click(&mut self, routes: &HashMap<u64, Route>, pointer: Pos2) {
-        match self.hit(routes, pointer) {
+    fn double_click(&mut self, ctx: &egui::Context, routes: &HashMap<u64, Route>, pointer: Pos2) {
+        match self.hit(ctx, routes, pointer) {
             Hit::Node(id) | Hit::Port(id, _) | Hit::Resize(id, _) => {
                 self.select_only_node(id);
                 self.start_edit(EditTarget::Node(id));
             }
-            Hit::Edge(id) | Hit::Bend(id, _) | Hit::EdgeEnd(id, _) => {
+            Hit::Edge(id) | Hit::Label(id) | Hit::Bend(id, _) | Hit::EdgeEnd(id, _) => {
                 self.select_only_edge(id);
                 self.start_edit(EditTarget::EdgeLabel(id));
             }
@@ -483,7 +530,7 @@ impl DecisiveApp {
             self.begin_drag(&ctx, &routes, origin);
         }
         if resp.dragged_by(PointerButton::Primary) {
-            self.update_drag(&ctx, pointer, resp.drag_delta());
+            self.update_drag(&ctx, &routes, pointer, resp.drag_delta());
         }
         if resp.drag_stopped_by(PointerButton::Primary) {
             self.end_drag(pointer);
@@ -492,20 +539,20 @@ impl DecisiveApp {
             self.click(&ctx, &routes, pointer);
         }
         if resp.double_clicked() {
-            self.double_click(&routes, pointer);
+            self.double_click(&ctx, &routes, pointer);
         }
         if resp.secondary_clicked() {
             self.context_pos = self.view().to_world(pointer);
             if self.editing.is_some() {
                 self.finish_edit();
             }
-            match self.hit(&routes, pointer) {
+            match self.hit(&ctx, &routes, pointer) {
                 Hit::Node(id) | Hit::Port(id, _) => {
                     if !self.sel_nodes.contains(&id) {
                         self.select_only_node(id);
                     }
                 }
-                Hit::Edge(id) | Hit::Bend(id, _) | Hit::EdgeEnd(id, _) => {
+                Hit::Edge(id) | Hit::Label(id) | Hit::Bend(id, _) | Hit::EdgeEnd(id, _) => {
                     if !self.sel_edges.contains(&id) {
                         self.select_only_edge(id);
                     }
@@ -523,7 +570,7 @@ impl DecisiveApp {
             && let Some(h) = hover
             && rect.contains(h)
         {
-            let icon = match self.hit(&routes, h) {
+            let icon = match self.hit(&ctx, &routes, h) {
                 Hit::Resize(_, handle) => handle.cursor(),
                 Hit::Port(..) => CursorIcon::Crosshair,
                 Hit::EdgeEnd(..) => CursorIcon::Grab,
@@ -531,6 +578,7 @@ impl DecisiveApp {
                 Hit::Bend(_, Axis::Y) => CursorIcon::ResizeVertical,
                 Hit::Node(_) => CursorIcon::Move,
                 Hit::Edge(_) => CursorIcon::PointingHand,
+                Hit::Label(_) => CursorIcon::Grab,
                 Hit::None => CursorIcon::Default,
             };
             ctx.set_cursor_icon(icon);
@@ -567,7 +615,7 @@ impl DecisiveApp {
                 continue;
             }
             if let Some(r) = routes.get(&e.id) {
-                render::paint_edge_label(&painter, &view, e, routing::label_anchor(&r.points), &ctx, &self.fonts);
+                render::paint_edge_label(&painter, &view, e, routing::label_anchor(&r.points, e.label_pos), &ctx, &self.fonts);
             }
         }
 
@@ -646,12 +694,34 @@ impl DecisiveApp {
                 let hr = Rect::from_center_size(view.to_screen(p), Vec2::splat(9.0));
                 painter.rect(hr, 1, Color32::WHITE, Stroke::new(1.5, SELECT_COLOR), StrokeKind::Middle);
             }
+            // Outline the label so it reads as draggable.
+            if let Some(e) = self.sel_edges.iter().next().and_then(|id| self.doc.edge(*id))
+                && self.editing != Some(EditTarget::EdgeLabel(e.id))
+                && let Some(b) = render::label_screen_rect(&view, e, routing::label_anchor(&r.points, e.label_pos), &ctx, &self.fonts)
+            {
+                painter.rect_stroke(b.expand(1.0), 2, Stroke::new(1.0, SELECT_COLOR), StrokeKind::Outside);
+            }
         }
 
         // Live previews.
         let world = view.to_world(pointer);
         let preview = Stroke::new(1.5, SELECT_COLOR);
         match &self.drag {
+            Drag::Label { edge } => {
+                if let (Some(e), Some(r)) = (self.doc.edge(*edge), routes.get(edge)) {
+                    let snapped = match e.label_pos {
+                        LabelPos::SegMid(i) => Some(i.min(r.points.len().saturating_sub(2))),
+                        _ => None,
+                    };
+                    for (i, m) in routing::segment_midpoints(&r.points).into_iter().enumerate() {
+                        let c = view.to_screen(m);
+                        let s = if snapped == Some(i) { 6.0 } else { 4.0 };
+                        let pts = vec![c + vec2(0.0, -s), c + vec2(s, 0.0), c + vec2(0.0, s), c + vec2(-s, 0.0)];
+                        let fill = if snapped == Some(i) { GUIDE_COLOR } else { Color32::WHITE };
+                        painter.add(egui::Shape::convex_polygon(pts, fill, Stroke::new(1.2, GUIDE_COLOR)));
+                    }
+                }
+            }
             Drag::Connect { from, side } => {
                 if let Some(src) = self.doc.node(*from) {
                     let target = self.port_under(pointer, Some(*from));
@@ -728,7 +798,8 @@ impl DecisiveApp {
                 }
             }
             Some(EditTarget::EdgeLabel(id)) => {
-                let Some(anchor) = routes.get(&id).map(|r| routing::label_anchor(&r.points)) else { return };
+                let Some(lp) = self.doc.edge(id).map(|e| e.label_pos) else { return };
+                let Some(anchor) = routes.get(&id).map(|r| routing::label_anchor(&r.points, lp)) else { return };
                 let Some(e) = self.doc.edge_mut(id) else { return };
                 let font = FontId::new(e.style.font_size * self.zoom, self.fonts.family(crate::presets::DEFAULT_FONT, false));
                 let c = view.to_screen(anchor);

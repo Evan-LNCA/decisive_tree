@@ -19,6 +19,7 @@ Diagrams save as `.dtree` files (JSON). Open one by dragging it onto the window 
 | Connect to a new step | Drag a port dot onto empty space |
 | Re-route a connector | Click it, then drag its end dot to another node or port |
 | Move a connector's bend | Click it, then drag the white square |
+| Move a connector's label | Drag the label along the line — it snaps to segment midpoints (hold Alt to place freely; "Auto label position" resets) |
 | Edit text | Double-click, or Enter / F2. Enter finishes, Shift+Enter adds a new line |
 | Style | Select nodes, then use the right panel (shape, fill, border, font, size, bold, underline, shadow). Clicking a palette preset applies it |
 | Select | Click, Shift+click, or drag a box on empty space |

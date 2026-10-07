@@ -196,7 +196,21 @@ pub struct Edge {
     #[serde(default)]
     pub bend: f32,
     #[serde(default)]
+    pub label_pos: LabelPos,
+    #[serde(default)]
     pub style: EdgeStyle,
+}
+
+/// Where a connector's label sits along its route.
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize, Debug, Default)]
+pub enum LabelPos {
+    /// Chosen automatically (entry segment, or the longest one).
+    #[default]
+    Auto,
+    /// Fraction (0..1) of the route's total length, measured from the source.
+    Along(f32),
+    /// Midpoint of the n-th segment from the source; stays centered as nodes move.
+    SegMid(usize),
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
@@ -269,6 +283,7 @@ impl Doc {
             to_side,
             label: String::new(),
             bend: 0.0,
+            label_pos: LabelPos::Auto,
             style: EdgeStyle::default(),
         });
         Some(id)
