@@ -973,6 +973,7 @@ impl DecisiveApp {
                 (_, Some(_)) => "Typing: Enter = done · Shift+Enter = new line · Tab = add next step · Esc = done",
                 (Drag::Connect { .. }, _) => "Drop on a node (or one of its ports) to connect · drop on empty space to create a new connected step",
                 (Drag::Reconnect { .. }, _) => "Drop on another node or port to re-route this connector",
+                (Drag::Bend { .. }, _) => "Align the bend with other connectors or node midpoints (hold Alt to place freely)",
                 (Drag::Label { .. }, _) => "Slide the label along the line · snaps to segment midpoints (hold Alt to place freely)",
                 _ => "Double-click: add/edit · Drag a blue port dot to connect · Tab: next step · Shift+Tab: branch below · Middle-drag/Space-drag: pan · Ctrl+wheel: zoom",
             };
@@ -1417,7 +1418,7 @@ const HELP: &[(&str, &str)] = &[
     ("Enter / F2", "Edit selected node text"),
     ("Enter while typing", "Finish (Shift+Enter for a new line)"),
     ("Drag connector end dot", "Re-route to another node or port"),
-    ("Drag connector square", "Move the bend"),
+    ("Drag connector square", "Move the bend; snaps to connectors and node midpoints (Alt = free)"),
     ("Drag connector label", "Slide it along the line; snaps to segment midpoints (Alt = free)"),
     ("Drag empty space", "Box select (Shift = add)"),
     ("Shift+click", "Add/remove from selection"),
