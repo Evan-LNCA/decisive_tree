@@ -15,6 +15,7 @@ const EDGE_HIT: f32 = 6.0;
 const GUIDE_COLOR: Color32 = Color32::from_rgb(0xE0, 0x3E, 0x9A);
 /// Screen distance within which a dragged label snaps to a segment midpoint.
 const LABEL_SNAP: f32 = 14.0;
+const CONNECTOR_SNAP: f32 = 8.0;
 
 #[derive(Clone, Copy, Debug)]
 enum Hit {
@@ -124,10 +125,8 @@ impl DecisiveApp {
             if !sr.contains(screen) {
                 continue;
             }
-            for s in Side::ALL {
-                if (port_screen(&view, n, s) - screen).length() <= PORT_HIT {
-                    return Some((n.id, Some(s)));
-                }
+            if let Some(s) = port_side_under(&view, n, screen) {
+                return Some((n.id, Some(s)));
             }
             if n.contains(world) {
                 return Some((n.id, None));
@@ -285,8 +284,14 @@ impl DecisiveApp {
             Drag::Bend { edge, axis, start, orig } => {
                 let d = world - start;
                 let mut bend = orig + if axis == Axis::X { d.x } else { d.y };
+                self.guides.clear();
                 if self.snap && !alt {
-                    bend = (bend / (GRID * 0.5)).round() * GRID * 0.5;
+                    if let Some((snapped, guide)) = routing::snap_bend(&self.doc, routes, edge, bend, CONNECTOR_SNAP / self.zoom) {
+                        bend = snapped;
+                        self.guides.push(guide);
+                    } else {
+                        bend = (bend / (GRID * 0.5)).round() * GRID * 0.5;
+                    }
                 }
                 if let Some(e) = self.doc.edge_mut(edge) {
                     e.bend = bend;
@@ -830,6 +835,18 @@ fn port_screen(view: &View, n: &Node, s: Side) -> Pos2 {
     view.to_screen(n.port(s)) + s.dir() * PORT_OFF
 }
 
+fn port_side_under(view: &View, n: &Node, screen: Pos2) -> Option<Side> {
+    Side::ALL
+        .into_iter()
+        .map(|s| {
+            let distance = (port_screen(view, n, s) - screen).length().min((view.to_screen(n.port(s)) - screen).length());
+            (s, distance)
+        })
+        .filter(|(_, distance)| *distance <= PORT_HIT)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(s, _)| s)
+}
+
 fn paint_grid(painter: &egui::Painter, view: &View, rect: Rect) {
     let mut step = GRID;
     while step * view.zoom < 9.0 {
@@ -853,5 +870,33 @@ fn paint_grid(painter: &egui::Painter, view: &View, rect: Rect) {
         let is_major = (y / major).round() * major == y;
         painter.line_segment([pos2(rect.min.x, sy), pos2(rect.max.x, sy)], Stroke::new(1.0, if is_major { major_c } else { minor_c }));
         y += step;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{NodeShape, NodeStyle};
+
+    #[test]
+    fn node_side_midpoints_and_port_dots_are_targets_at_every_zoom() {
+        for shape in NodeShape::ALL {
+            let node = Node {
+                id: 1,
+                pos: pos2(100.0, 200.0),
+                size: vec2(160.0, 80.0),
+                text: String::new(),
+                style: NodeStyle { shape, ..NodeStyle::default() },
+            };
+            for zoom in [0.25, 1.0, 3.0] {
+                let view = View { origin: pos2(30.0, 60.0), pan: vec2(20.0, -10.0), zoom };
+                for side in Side::ALL {
+                    let midpoint = view.to_screen(node.port(side));
+                    assert_eq!(port_side_under(&view, &node, midpoint), Some(side));
+                    assert_eq!(port_side_under(&view, &node, port_screen(&view, &node, side)), Some(side));
+                    assert_eq!(port_side_under(&view, &node, midpoint - side.dir() * 8.0), Some(side));
+                }
+            }
+        }
     }
 }

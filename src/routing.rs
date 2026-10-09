@@ -19,6 +19,15 @@ pub enum Axis {
     Y,
 }
 
+impl Axis {
+    fn coordinate(self, p: Pos2) -> f32 {
+        match self {
+            Self::X => p.x,
+            Self::Y => p.y,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Route {
     pub points: Vec<Pos2>,
@@ -61,6 +70,44 @@ pub fn compute_routes(doc: &Doc) -> HashMap<u64, Route> {
         routes.insert(e.id, Route { points: simplify(points), from_side: s1, to_side: s2, handle });
     }
     routes
+}
+
+/// Aligns a dragged bend with parallel connector segments or node centerlines.
+pub fn snap_bend(doc: &Doc, routes: &HashMap<u64, Route>, edge: u64, bend: f32, tolerance: f32) -> Option<(f32, (Pos2, Pos2))> {
+    let current = doc.edge(edge)?;
+    let (handle, axis) = routes.get(&edge)?.handle?;
+    let base = axis.coordinate(handle) - current.bend;
+    let desired = base + bend;
+    let mut best: Option<(f32, f32, (Pos2, Pos2))> = None;
+    let mut consider = |a: Pos2, b: Pos2| {
+        let coordinate = axis.coordinate(a);
+        let distance = (coordinate - desired).abs();
+        if distance <= tolerance && best.is_none_or(|best| distance < best.0) {
+            let guide = match axis {
+                Axis::X => (pos2(coordinate, a.y.min(b.y).min(handle.y)), pos2(coordinate, a.y.max(b.y).max(handle.y))),
+                Axis::Y => (pos2(a.x.min(b.x).min(handle.x), coordinate), pos2(a.x.max(b.x).max(handle.x), coordinate)),
+            };
+            best = Some((distance, coordinate - base, guide));
+        }
+    };
+    for n in &doc.nodes {
+        let r = n.rect();
+        match axis {
+            Axis::X => consider(pos2(r.center().x, r.min.y), pos2(r.center().x, r.max.y)),
+            Axis::Y => consider(pos2(r.min.x, r.center().y), pos2(r.max.x, r.center().y)),
+        }
+    }
+    for e in doc.edges.iter().filter(|e| e.id != edge) {
+        if let Some(route) = routes.get(&e.id) {
+            for segment in route.points.windows(2) {
+                let (a, b) = (segment[0], segment[1]);
+                if (axis.coordinate(a) - axis.coordinate(b)).abs() < 0.01 && (b - a).length_sq() > 0.01 {
+                    consider(a, b);
+                }
+            }
+        }
+    }
+    best.map(|(_, bend, guide)| (bend, guide))
 }
 
 /// Route for an in-progress connection drag (target is a free point).
@@ -367,4 +414,94 @@ pub fn project_along(points: &[Pos2], p: Pos2) -> (f32, Pos2) {
 /// Midpoints of every segment, in order from the source.
 pub fn segment_midpoints(points: &[Pos2]) -> Vec<Pos2> {
     points.windows(2).map(|w| w[0] + (w[1] - w[0]) * 0.5).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{NodeShape, NodeStyle};
+    use egui::vec2;
+
+    fn diagram(transpose: bool) -> (Doc, u64, u64) {
+        let mut doc = Doc::default();
+        let mut add = |center| {
+            let size = vec2(80.0, 40.0);
+            doc.add_node(
+                if transpose { tp(center) } else { center },
+                if transpose { vec2(size.y, size.x) } else { size },
+                NodeStyle::default(),
+                "",
+            )
+        };
+        let a = add(pos2(0.0, 0.0));
+        let b = add(pos2(300.0, 100.0));
+        let c = add(pos2(71.0, 300.0));
+        let d = add(pos2(371.0, 400.0));
+        let (from, to) = if transpose { (Side::Bottom, Side::Top) } else { (Side::Right, Side::Left) };
+        let edge = doc.add_edge(a, b, Some(from), Some(to)).unwrap();
+        let other = doc.add_edge(c, d, Some(from), Some(to)).unwrap();
+        (doc, edge, other)
+    }
+
+    #[test]
+    fn bends_align_with_parallel_segments_on_both_axes() {
+        for transpose in [false, true] {
+            let (mut doc, edge, other) = diagram(transpose);
+            doc.edge_mut(edge).unwrap().bend = 19.0;
+            let routes = compute_routes(&doc);
+            let (bend, (a, b)) = snap_bend(&doc, &routes, edge, 68.0, 8.0).unwrap();
+            assert_eq!(bend, 71.0);
+            let (target, axis) = routes[&other].handle.unwrap();
+            assert_eq!(axis.coordinate(a), axis.coordinate(target));
+            assert_eq!(axis.coordinate(b), axis.coordinate(target));
+            doc.edge_mut(edge).unwrap().bend = bend;
+            let updated = compute_routes(&doc);
+            assert_eq!(axis.coordinate(updated[&edge].handle.unwrap().0), axis.coordinate(target));
+        }
+    }
+
+    #[test]
+    fn bends_align_with_midpoints_of_every_node_shape() {
+        for transpose in [false, true] {
+            for shape in NodeShape::ALL {
+                let (mut doc, edge, _) = diagram(transpose);
+                let center = if transpose { pos2(250.0, 213.0) } else { pos2(213.0, 250.0) };
+                doc.add_node(center, vec2(60.0, 40.0), NodeStyle { shape, ..NodeStyle::default() }, "");
+                let routes = compute_routes(&doc);
+                let (bend, _) = snap_bend(&doc, &routes, edge, 60.0, 8.0).unwrap();
+                assert_eq!(bend, 63.0);
+                doc.edge_mut(edge).unwrap().bend = bend;
+                let updated = compute_routes(&doc);
+                let (handle, axis) = updated[&edge].handle.unwrap();
+                assert_eq!(axis.coordinate(handle), axis.coordinate(center));
+            }
+        }
+    }
+
+    #[test]
+    fn closest_alignment_wins_over_a_connector() {
+        let (mut doc, edge, _) = diagram(false);
+        doc.add_node(pos2(216.0, 250.0), vec2(60.0, 40.0), NodeStyle::default(), "");
+        let routes = compute_routes(&doc);
+        assert_eq!(snap_bend(&doc, &routes, edge, 68.0, 8.0).unwrap().0, 66.0);
+    }
+
+    #[test]
+    fn snap_threshold_is_constant_in_screen_space() {
+        let (doc, edge, _) = diagram(false);
+        let routes = compute_routes(&doc);
+        for zoom in [0.5, 1.0, 2.0] {
+            let tolerance = 8.0 / zoom;
+            assert!(snap_bend(&doc, &routes, edge, 71.0 + tolerance, tolerance).is_some());
+            assert!(snap_bend(&doc, &routes, edge, 71.0 + tolerance + 0.1, tolerance).is_none());
+        }
+    }
+
+    #[test]
+    fn dragged_route_does_not_snap_to_itself_or_perpendicular_segments() {
+        let (doc, edge, _) = diagram(false);
+        let routes = compute_routes(&doc);
+        assert!(snap_bend(&doc, &routes, edge, 0.0, 8.0).is_none());
+        assert!(snap_bend(&doc, &routes, edge, -35.0, 8.0).is_none());
+    }
 }
